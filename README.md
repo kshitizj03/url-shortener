@@ -134,8 +134,3 @@ On every redirect, a click event is published to a Redis channel and the 302 res
 
 Uses Redis sorted sets keyed by IP address. On each request, entries older than 60 seconds are removed, the remaining count is checked, and a new entry is added if under the limit. Shared Redis means the limit is enforced consistently across multiple server instances.
 
----
-
-## License
-
-MIT
