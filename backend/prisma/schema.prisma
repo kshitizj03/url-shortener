@@ -1,0 +1,35 @@
+// Prisma schema for URL Shortener
+// Supports PostgreSQL with BigInt IDs (Snowflake)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Url {
+  id        BigInt    @id
+  shortCode String    @unique
+  longUrl   String
+  createdAt DateTime  @default(now())
+  expiresAt DateTime?
+  clicks    Click[]
+
+  @@index([shortCode])
+}
+
+model Click {
+  id        Int      @id @default(autoincrement())
+  urlId     BigInt
+  url       Url      @relation(fields: [urlId], references: [id], onDelete: Cascade)
+  clickedAt DateTime @default(now())
+  country   String?
+  referrer  String?
+  userAgent String?
+
+  @@index([urlId])
+  @@index([clickedAt])
+}
