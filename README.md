@@ -68,7 +68,7 @@ GET /aX9kRm ──► Redis Cache ──► HIT  ──► 302 Redirect
 ### Run with Docker
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/kshitizj03/url-shortener
 cd url-shortener
 
 cp backend/.env.example backend/.env
