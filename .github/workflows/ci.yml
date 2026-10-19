@@ -13,12 +13,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Build frontend
+      - name: Test and build frontend
         working-directory: frontend
-        run: npm ci && npm run build
+        run: |
+          npm ci
+          npm test
+          npm run build
       - name: Typecheck and test worker
         working-directory: worker
         run: |
           npm ci
+          # `wrangler types` reads secret names from .dev.vars; CI has none, so use the example
+          # (placeholders only, tests pin their own bindings).
+          cp .dev.vars.example .dev.vars
           npm run typecheck
           npm test

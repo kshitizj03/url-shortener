@@ -3,9 +3,7 @@ import ShortenForm from './components/ShortenForm'
 import ResultCard from './components/ResultCard'
 import AnalyticsDashboard from './components/AnalyticsDashboard'
 import { loadLinks, saveLinks } from './myLinks'
-
-// Same origin in production (the Worker serves this app); Vite proxies /api in dev.
-const API_URL = import.meta.env.VITE_API_URL || ''
+import { api } from './api'
 
 function App() {
   const [result, setResult] = useState(null)
@@ -24,14 +22,10 @@ function App() {
     setResult(null)
 
     try {
-      const response = await fetch(`${API_URL}/api/links`, {
+      const data = await api('/api/links', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, slug: slug || undefined, expiresAt: expiresAt || undefined }),
+        body: { url, slug: slug || undefined, expiresAt: expiresAt || undefined },
       })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.error || 'Failed to shorten URL')
-
       setResult(data)
       updateLinks([data, ...links])
     } catch (err) {
@@ -63,7 +57,6 @@ function App() {
         <section className="bg-white rounded-xl shadow-lg p-6">
           <h2 className="text-xl font-semibold text-gray-800 mb-4">My Links</h2>
           <AnalyticsDashboard
-            apiUrl={API_URL}
             links={links}
             onDelete={(slug) => updateLinks(links.filter((l) => l.slug !== slug))}
           />

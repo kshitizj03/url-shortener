@@ -55,13 +55,14 @@ export function rateLimitKey(ip: string): string {
  */
 export function targetProblem(url: URL, selfHost: string): string | null {
   if (url.username || url.password) return 'URLs with embedded credentials are not allowed'; // https://paypal.com@evil.com
-  const host = url.hostname;
+  // A trailing dot is the same host to DNS ('localhost.' is localhost), so compare without it.
+  const host = url.hostname.replace(/\.+$/, '');
   // Raw IPs are a strong phishing signal and cover private ranges (127.x, 10.x, 192.168.x, [::1]...).
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.startsWith('[')) return 'Links to raw IP addresses are not allowed';
   if (!host.includes('.') || /\.(localhost|local|internal|lan|home|test|invalid)$/.test(host)) {
     return 'Links must point to a public domain';
   }
-  if (url.host === selfHost) return 'Cannot shorten a link to this shortener';
+  if ((url.port ? `${host}:${url.port}` : host) === selfHost) return 'Cannot shorten a link to this shortener';
   return null;
 }
 

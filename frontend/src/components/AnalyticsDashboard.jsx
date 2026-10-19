@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
+import { api } from '../api'
 
 function Breakdown({ title, rows }) {
   return (
     <div className="p-4 bg-gray-50 rounded-xl border border-gray-200">
       <h4 className="font-medium text-gray-800 mb-2">{title}</h4>
       {rows.length === 0 ? (
-        <p className="text-sm text-gray-400">No data yet</p>
+        <p className="text-sm text-gray-500">No data yet</p>
       ) : (
         <ul className="space-y-1 text-sm">
           {rows.map((r) => (
@@ -21,18 +22,16 @@ function Breakdown({ title, rows }) {
   )
 }
 
-function AnalyticsDashboard({ apiUrl, links, onDelete }) {
-  const [selected, setSelected] = useState(links[0]?.slug ?? null)
+function AnalyticsDashboard({ links, onDelete }) {
+  // New links are added to the front, so following links[0] jumps to a link right after it is created.
+  const newest = links[0]?.slug
+  const [selected, setSelected] = useState(newest)
+  useEffect(() => setSelected(newest), [newest])
+  const link = links.find((l) => l.slug === selected) ?? links[0] // falls back if the selected one was deleted
+
   const [stats, setStats] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-
-  const link = links.find((l) => l.slug === selected)
-
-  // Pick a link when none is selected yet or the selected one was deleted.
-  useEffect(() => {
-    if (!link) setSelected(links[0]?.slug ?? null)
-  }, [links, link])
 
   useEffect(() => {
     if (!link) return
@@ -40,30 +39,24 @@ function AnalyticsDashboard({ apiUrl, links, onDelete }) {
     setLoading(true)
     setError(null)
     setStats(null)
-    fetch(`${apiUrl}/api/links/${link.slug}`, { headers: { Authorization: `Bearer ${link.manageToken}` } })
-      .then(async (res) => {
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.error || 'Failed to fetch analytics')
-        if (!cancelled) setStats(data)
-      })
+    api(`/api/links/${link.slug}`, { token: link.manageToken })
+      .then((data) => !cancelled && setStats(data))
       .catch((err) => !cancelled && setError(err.message))
       .finally(() => !cancelled && setLoading(false))
     return () => { cancelled = true }
-  }, [apiUrl, link])
+  }, [link])
 
   const handleDelete = async () => {
     if (!confirm(`Delete ${link.shortUrl}? Its analytics are deleted too.`)) return
-    const res = await fetch(`${apiUrl}/api/links/${link.slug}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${link.manageToken}` },
-    })
-    // 404 means it is already gone, so forget it locally either way.
-    if (res.ok || res.status === 404) {
-      setStats(null)
-      onDelete(link.slug)
-    } else {
-      setError((await res.json()).error || 'Failed to delete')
+    setError(null)
+    try {
+      await api(`/api/links/${link.slug}`, { method: 'DELETE', token: link.manageToken })
+    } catch (err) {
+      // 404 means it is already gone (for example, taken down), so forget it locally anyway.
+      if (err.status !== 404) return setError(err.message)
     }
+    setStats(null)
+    onDelete(link.slug)
   }
 
   if (links.length === 0) {
@@ -80,7 +73,7 @@ function AnalyticsDashboard({ apiUrl, links, onDelete }) {
         <label htmlFor="link-select" className="text-sm text-gray-700">Link</label>
         <select
           id="link-select"
-          value={selected ?? ''}
+          value={link.slug}
           onChange={(e) => setSelected(e.target.value)}
           className="flex-1 min-w-0 px-3 py-2 border border-gray-300 rounded-lg"
         >
@@ -106,17 +99,19 @@ function AnalyticsDashboard({ apiUrl, links, onDelete }) {
         <div className="space-y-6">
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="p-6 bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl text-white">
-              <p className="text-sm opacity-80">Human clicks</p>
+              <p className="text-sm opacity-90">Human clicks, last {stats.days} days</p>
               <p className="text-4xl font-bold mt-1">{stats.clicks}</p>
             </div>
             <div className="p-6 bg-gray-50 rounded-xl border border-gray-200">
-              <p className="text-sm text-gray-500">Bot and link-preview hits (not counted)</p>
+              <p className="text-sm text-gray-600">Bot and link-preview hits (not counted)</p>
               <p className="text-4xl font-bold mt-1 text-gray-700">{stats.botClicks}</p>
             </div>
           </div>
 
           <div className="p-4 bg-gray-50 rounded-xl border border-gray-200">
-            <h3 className="font-medium text-gray-800 mb-4">Last 30 days</h3>
+            <h3 className="font-medium text-gray-800 mb-4">Last {stats.days} days</h3>
+            {/* The chart is visual only; screen readers get the same numbers as a table below. */}
+            <div aria-hidden="true">
             <ResponsiveContainer width="100%" height={250}>
               <LineChart data={stats.daily}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
@@ -126,6 +121,14 @@ function AnalyticsDashboard({ apiUrl, links, onDelete }) {
                 <Line type="monotone" dataKey="clicks" stroke="#3B82F6" strokeWidth={2} dot={false} />
               </LineChart>
             </ResponsiveContainer>
+            </div>
+            <table className="sr-only">
+              <caption>Human clicks per day, last {stats.days} days</caption>
+              <thead><tr><th scope="col">Day</th><th scope="col">Clicks</th></tr></thead>
+              <tbody>
+                {stats.daily.map((d) => <tr key={d.day}><td>{d.day}</td><td>{d.clicks}</td></tr>)}
+              </tbody>
+            </table>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">

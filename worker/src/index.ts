@@ -13,6 +13,8 @@ type Cached = Pick<Link, 'id' | 'url' | 'expires_at'>;
 type Ctx = Context<{ Bindings: Env }>;
 
 const HOUR = 3_600_000;
+const DEFAULT_CREATE_LIMIT = 20;
+const STATS_DAYS = 30;
 const SLUG = '[A-Za-z0-9_-]{3,32}';
 // ponytail: Cache API is per data center and a no-op on *.workers.dev, so after a delete other
 // data centers can serve the old target for up to this long. Lower it, or move to KV, if that matters.
@@ -20,8 +22,8 @@ const CACHE_SECONDS = 300;
 
 const app = new Hono<{ Bindings: Env }>();
 
-// API responses and the 404/410 pages. The React app's headers live in frontend/public/_headers.
-app.use(secureHeaders({
+// Headers for everything the Worker answers. The React app's headers live in frontend/public/_headers.
+const headerPolicy: NonNullable<Parameters<typeof secureHeaders>[0]> = {
   contentSecurityPolicy: {
     defaultSrc: ["'none'"],
     styleSrc: ["'unsafe-inline'"], // the error pages' one <style> block
@@ -30,7 +32,12 @@ app.use(secureHeaders({
     frameAncestors: ["'none'"],
   },
   xFrameOptions: 'DENY',
-}));
+};
+const apiHeaders = secureHeaders(headerPolicy); // CORP same-origin: API JSON is never embedded elsewhere
+// Redirects must be usable from any site, e.g. a short link as an <img> src; CORP same-origin on
+// the 302 makes browsers block that (ERR_BLOCKED_BY_RESPONSE.NotSameOrigin).
+const linkHeaders = secureHeaders({ ...headerPolicy, crossOriginResourcePolicy: false });
+app.use((c, next) => (c.req.path.startsWith('/api/') ? apiHeaders : linkHeaders)(c, next));
 
 app.use('/api/*', bodyLimit({ maxSize: 8 * 1024, onError: (c) => c.json({ error: 'Request body too large' }, 413) }));
 
@@ -82,12 +89,14 @@ app.post('/api/links', zValidator('json', createBody, (result, c) => {
 
   if (!c.env.IP_SALT) throw new Error('IP_SALT secret is not set'); // never hash IPs with a guessable salt
 
+  // Every attempt that gets this far counts, whatever happens next (flagged URL, taken slug,
+  // Safe Browsing error), so neither bad submissions nor deleting links frees budget.
   // ponytail: count-then-insert, so a burst of parallel requests can overshoot by a few.
   // Fine for abuse control; use a Durable Object counter if it ever needs to be exact.
   const creator = await sha256(`${c.env.IP_SALT}:${rateLimitKey(c.req.header('CF-Connecting-IP') ?? 'unknown')}`);
-  const limit = Number(c.env.CREATE_LIMIT_PER_HOUR);
+  const limit = Number(c.env.CREATE_LIMIT_PER_HOUR) || DEFAULT_CREATE_LIMIT; // a missing var must not disable the limit
   const recent = await c.env.DB
-    .prepare('SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM links WHERE creator_hash = ? AND created_at > ?')
+    .prepare('SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM create_attempts WHERE creator_hash = ? AND ts > ?')
     .bind(creator, now - HOUR)
     .first<{ n: number; oldest: number | null }>();
   if (recent && recent.n >= limit) {
@@ -95,8 +104,10 @@ app.post('/api/links', zValidator('json', createBody, (result, c) => {
     c.header('Retry-After', String(retryAfter));
     return c.json({ error: `Rate limit reached: ${limit} links per hour. Try again in ${Math.ceil(retryAfter / 60)} min.` }, 429);
   }
+  // Only allowed attempts are written, so a blocked client hammering us costs reads, not writes.
+  await c.env.DB.prepare('INSERT INTO create_attempts (creator_hash, ts) VALUES (?, ?)').bind(creator, now).run();
 
-  // Checked after the rate limit so abusers can't spend our Safe Browsing quota.
+  // After the rate limit, so abusers can't spend our Safe Browsing quota.
   if (c.env.URL_SCREENING !== 'off') {
     if (!c.env.SAFE_BROWSING_KEY) {
       console.error('SAFE_BROWSING_KEY is not set, refusing to create links unscreened');
@@ -115,8 +126,8 @@ app.post('/api/links', zValidator('json', createBody, (result, c) => {
   const token = randomToken();
   const tokenHash = await sha256(token);
   const insert = c.env.DB.prepare(
-    `INSERT INTO links (slug, url, token_hash, creator_hash, created_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, // either the exact slug or a case variant exists
+    `INSERT INTO links (slug, url, token_hash, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, // either the exact slug or a case variant exists
   );
 
   // Random slugs: 3 tries at 7 chars, then 8. The case-insensitive unique index leaves 36^7
@@ -125,7 +136,7 @@ app.post('/api/links', zValidator('json', createBody, (result, c) => {
   const candidates = customSlug ? [customSlug] : [7, 7, 7, 8, 8].map((n) => randomSlug(n));
   let slug: string | null = null;
   for (const candidate of candidates) {
-    const { meta } = await insert.bind(candidate, url, tokenHash, creator, now, expires).run();
+    const { meta } = await insert.bind(candidate, url, tokenHash, now, expires).run();
     if (meta.changes === 1) { slug = candidate; break; }
   }
   if (!slug) {
@@ -148,18 +159,22 @@ app.get(`/api/links/:slug{${SLUG}}`, async (c) => {
   const link = await authorize(c, c.req.param('slug'));
   if (link instanceof Response) return link;
 
-  const days = lastDays(30);
+  // Every query is bounded to the last STATS_DAYS via the (link_id, ts) index, so a view costs
+  // rows read proportional to recent clicks, not to the link's whole history.
+  // ponytail: still scans each recent click; add a daily rollup table if links get ~100k clicks a month.
+  const days = lastDays(STATS_DAYS);
   const since = Date.parse(days[0]!);
   const db = c.env.DB;
+  const recentHumans = 'FROM clicks WHERE link_id = ? AND ts >= ? AND is_bot = 0';
   // `column` is always one of the literals below, never user input.
   const top = (column: 'country' | 'device' | 'browser' | 'referrer') =>
-    db.prepare(`SELECT ${column} AS value, COUNT(*) AS clicks FROM clicks
-                WHERE link_id = ? AND is_bot = 0 GROUP BY value ORDER BY clicks DESC LIMIT 10`).bind(link.id);
+    db.prepare(`SELECT ${column} AS value, COUNT(*) AS clicks ${recentHumans}
+                GROUP BY value ORDER BY clicks DESC LIMIT 10`).bind(link.id, since);
 
   const [totals, daily, countries, devices, browsers, referrers] = await db.batch<any>([
-    db.prepare('SELECT COUNT(*) - COALESCE(SUM(is_bot), 0) AS clicks, COALESCE(SUM(is_bot), 0) AS bots FROM clicks WHERE link_id = ?').bind(link.id),
-    db.prepare(`SELECT date(ts / 1000, 'unixepoch') AS day, COUNT(*) AS clicks FROM clicks
-                WHERE link_id = ? AND is_bot = 0 AND ts >= ? GROUP BY day`).bind(link.id, since),
+    db.prepare(`SELECT COUNT(*) - COALESCE(SUM(is_bot), 0) AS clicks, COALESCE(SUM(is_bot), 0) AS bots
+                FROM clicks WHERE link_id = ? AND ts >= ?`).bind(link.id, since),
+    db.prepare(`SELECT date(ts / 1000, 'unixepoch') AS day, COUNT(*) AS clicks ${recentHumans} GROUP BY day`).bind(link.id, since),
     top('country'), top('device'), top('browser'), top('referrer'),
   ]);
 
@@ -169,6 +184,7 @@ app.get(`/api/links/:slug{${SLUG}}`, async (c) => {
     url: link.url,
     createdAt: new Date(link.created_at).toISOString(),
     expiresAt: link.expires_at ? new Date(link.expires_at).toISOString() : null,
+    days: STATS_DAYS, // every number below covers this window
     clicks: totals!.results[0].clicks,
     botClicks: totals!.results[0].bots,
     daily: days.map((day) => ({ day, clicks: perDay.get(day) ?? 0 })),
@@ -226,17 +242,19 @@ app.notFound((c) =>
 
 app.onError((err, c) => {
   console.error('unhandled', { path: c.req.path, err: String(err) });
-  return c.json({ error: 'Internal server error' }, 500);
+  return c.req.path.startsWith('/api/')
+    ? c.json({ error: 'Internal server error' }, 500)
+    : htmlPage(500, 'Something went wrong', 'Please try this link again in a moment.'); // visitors are browsers
 });
 
-/** Rate-limit hashes are only needed for an hour, so they are not kept beyond that. */
-export async function forgetCreators(db: D1Database, now = Date.now()) {
-  await db.prepare("UPDATE links SET creator_hash = '' WHERE created_at < ? AND creator_hash != ''").bind(now - HOUR).run();
+/** Attempts only matter for an hour of rate limiting, so (salted, hashed) IPs are not kept longer. */
+export async function pruneAttempts(db: D1Database, now = Date.now()) {
+  await db.prepare('DELETE FROM create_attempts WHERE ts < ?').bind(now - HOUR).run(); // uses create_attempts_time
 }
 
 export default {
   fetch: app.fetch,
   async scheduled(_controller, env) {
-    await forgetCreators(env.DB);
+    await pruneAttempts(env.DB);
   },
 } satisfies ExportedHandler<Env>;

@@ -1,7 +1,7 @@
 import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { env } from 'cloudflare:workers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import worker, { forgetCreators } from '../src/index';
+import worker, { pruneAttempts } from '../src/index';
 import { parseUserAgent, randomSlug, rateLimitKey } from '../src/lib';
 
 const ORIGIN = 'https://sho.rt';
@@ -100,6 +100,10 @@ describe('create validation', () => {
     [{ url: 'http://[::1]:8080/' }, 'raw IP'],
     [{ url: 'http://localhost:3000/' }, 'public domain'],
     [{ url: 'http://intranet/wiki' }, 'public domain'],
+    [{ url: 'http://localhost./' }, 'public domain'],
+    [{ url: 'http://router.local./admin' }, 'public domain'],
+    [{ url: `${ORIGIN}./abc1234` }, 'this shortener'],
+    [{ url: `${ORIGIN}../abc1234` }, 'this shortener'],
     [{ url: 'https://example.com', slug: 'API' }, 'reserved'],
     [{ url: 'https://example.com', slug: 'a b' }, 'slug'],
     [{ url: 'https://example.com', expiresAt: '2001-01-01T00:00:00Z' }, 'future'],
@@ -142,22 +146,56 @@ describe('rate limit', () => {
     expect((await create({ url: 'https://example.com' }, { ip: '2001:db8:1:3::1' })).status).toBe(201);
   });
 
-  it('forgets creator hashes older than an hour', async () => {
-    const link = await createOk();
-    const hash = () => env.DB.prepare('SELECT creator_hash FROM links WHERE slug = ?').bind(link.slug).first('creator_hash');
-    await forgetCreators(env.DB);
-    expect(await hash()).not.toBe(''); // still inside the hour
-    await forgetCreators(env.DB, Date.now() + HOUR_MS + 1);
-    expect(await hash()).toBe('');
+  it('counts attempts, so deleting links does not free budget', async () => {
+    const ip = freshIp();
+    for (let i = 0; i < 3; i++) {
+      const res = await create({ url: 'https://example.com' }, { ip });
+      expect(res.status).toBe(201);
+      const { slug, manageToken } = await res.json<any>();
+      expect((await call(`/api/links/${slug}`, { method: 'DELETE', ...auth(manageToken) }, { ip })).status).toBe(204);
+    }
+    expect((await create({ url: 'https://example.com' }, { ip })).status).toBe(429);
+  });
+
+  it('counts rejected attempts too: a taken slug still uses budget', async () => {
+    const ip = freshIp();
+    await createOk({ url: 'https://example.com', slug: 'budget-test' });
+    for (let i = 0; i < 3; i++) expect((await create({ url: 'https://example.com', slug: 'budget-test' }, { ip })).status).toBe(409);
+    expect((await create({ url: 'https://example.com' }, { ip })).status).toBe(429);
+  });
+
+  it('does not write attempts for blocked requests', async () => {
+    const ip = freshIp();
+    for (let i = 0; i < 3; i++) await create({ url: 'https://example.com' }, { ip });
+    const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM create_attempts').first('n');
+    for (let i = 0; i < 5; i++) expect((await create({ url: 'https://example.com' }, { ip })).status).toBe(429);
+    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM create_attempts').first('n')).toBe(before);
+  });
+
+  it('falls back to 20 per hour when CREATE_LIMIT_PER_HOUR is missing, instead of no limit', async () => {
+    const ip = freshIp();
+    const noVar = { env: { CREATE_LIMIT_PER_HOUR: undefined as unknown as Env["CREATE_LIMIT_PER_HOUR"] }, ip };
+    for (let i = 0; i < 20; i++) expect((await create({ url: 'https://example.com' }, noVar)).status).toBe(201);
+    expect((await create({ url: 'https://example.com' }, noVar)).status).toBe(429);
+  });
+
+  it('prunes attempts older than an hour', async () => {
+    await createOk();
+    const count = () => env.DB.prepare('SELECT COUNT(*) AS n FROM create_attempts').first<number>('n');
+    await pruneAttempts(env.DB);
+    expect(await count()).toBeGreaterThan(0); // still inside the hour
+    await pruneAttempts(env.DB, Date.now() + HOUR_MS + 1);
+    expect(await count()).toBe(0);
   });
 });
 
 describe('url screening', () => {
   const screening = { env: { URL_SCREENING: '', SAFE_BROWSING_KEY: 'test-key' } };
-  const mockGoogle = (response: Response) => vi.spyOn(globalThis, 'fetch').mockResolvedValue(response);
+  // A fresh Response per call: a body can only be read once.
+  const mockGoogle = (make: () => Response) => vi.spyOn(globalThis, 'fetch').mockImplementation(async () => make());
 
   it('blocks URLs Google flags', async () => {
-    const fetchSpy = mockGoogle(Response.json({ matches: [{ threatType: 'SOCIAL_ENGINEERING' }] }));
+    const fetchSpy = mockGoogle(() => Response.json({ matches: [{ threatType: 'SOCIAL_ENGINEERING' }] }));
     const res = await create({ url: 'https://phish.example/login' }, screening);
     expect(res.status).toBe(400);
     expect(await errorOf(res)).toContain('unsafe');
@@ -166,14 +204,23 @@ describe('url screening', () => {
     expect(JSON.parse(String(init!.body)).threatInfo.threatEntries).toEqual([{ url: 'https://phish.example/login' }]);
   });
 
+  it('counts flagged URLs toward the rate limit, so Google is not called without bound', async () => {
+    const google = mockGoogle(() => Response.json({ matches: [{ threatType: 'MALWARE' }] }));
+    const ip = freshIp();
+    const statuses = [];
+    for (let i = 0; i < 6; i++) statuses.push((await create({ url: `https://bad${i}.example/` }, { ...screening, ip })).status);
+    expect(statuses).toEqual([400, 400, 400, 429, 429, 429]);
+    expect(google).toHaveBeenCalledTimes(3);
+  });
+
   it('allows URLs Google has no match for', async () => {
-    mockGoogle(Response.json({}));
+    mockGoogle(() => Response.json({}));
     expect((await create({ url: 'https://example.com' }, screening)).status).toBe(201);
   });
 
   it('fails closed when Google errors or the key is missing', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    mockGoogle(new Response('quota exceeded', { status: 429 }));
+    mockGoogle(() => new Response('quota exceeded', { status: 429 }));
     expect((await create({ url: 'https://example.com' }, screening)).status).toBe(503);
     expect((await create({ url: 'https://example.com' }, { env: { URL_SCREENING: '', SAFE_BROWSING_KEY: '' } })).status).toBe(503);
   });
@@ -212,6 +259,17 @@ describe('redirect', () => {
     expect(res.headers.get('Content-Type')).toContain('text/html');
   });
 
+  it('shows browsers an HTML error page on internal errors, while the API keeps JSON', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const brokenDb = { prepare() { throw new Error('D1 is down'); } } as unknown as D1Database;
+    const page = await call('/zzzzzzz', {}, { env: { DB: brokenDb } });
+    expect(page.status).toBe(500);
+    expect(page.headers.get('Content-Type')).toContain('text/html');
+    const api = await call('/api/health', {}, { env: { DB: brokenDb } });
+    expect(api.status).toBe(500);
+    expect(api.headers.get('Content-Type')).toContain('application/json');
+  });
+
   it('410s once expired', async () => {
     const link = await createOk({ url: 'https://example.com', expiresAt: new Date(Date.now() + HOUR_MS).toISOString() });
     expect(link.expiresAt).not.toBeNull();
@@ -221,6 +279,15 @@ describe('redirect', () => {
 });
 
 describe('security headers', () => {
+  it('leave redirects embeddable cross-origin (no CORP) but keep CORP same-origin on the API', async () => {
+    const link = await createOk();
+    const redirect = await call(`/${link.slug}`);
+    expect(redirect.status).toBe(302);
+    expect(redirect.headers.get('Cross-Origin-Resource-Policy')).toBeNull();
+    expect(redirect.headers.get('X-Content-Type-Options')).toBe('nosniff'); // the rest still applies
+    expect((await call('/api/health')).headers.get('Cross-Origin-Resource-Policy')).toBe('same-origin');
+  });
+
   it('are set on API responses and HTML pages', async () => {
     for (const res of [await call('/api/health'), await call('/nope1234')]) {
       expect(res.headers.get('Content-Security-Policy')).toContain("default-src 'none'");
@@ -233,6 +300,20 @@ describe('security headers', () => {
 });
 
 describe('stats', () => {
+  it('only counts the last 30 days, in totals and breakdowns alike', async () => {
+    const link = await createOk();
+    await call(`/${link.slug}`, { headers: { 'User-Agent': CHROME } });
+    const id = await env.DB.prepare('SELECT id FROM links WHERE slug = ?').bind(link.slug).first('id');
+    // An old click: outside the window, so it must not show up anywhere.
+    await env.DB.prepare("INSERT INTO clicks (link_id, ts, country, device, browser, is_bot) VALUES (?, ?, 'FR', 'desktop', 'Firefox', 0)")
+      .bind(id, Date.now() - 40 * 86_400_000).run();
+    const stats = await (await call(`/api/links/${link.slug}`, auth(link.manageToken))).json<any>();
+    expect(stats.days).toBe(30);
+    expect(stats.clicks).toBe(1);
+    expect(stats.browsers).toEqual([{ value: 'Chrome', clicks: 1 }]);
+    expect(stats.countries.some((r: any) => r.value === 'FR')).toBe(false);
+  });
+
   it('requires the manage token', async () => {
     const link = await createOk();
     expect((await call(`/api/links/${link.slug}`)).status).toBe(401);
