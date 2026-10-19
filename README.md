@@ -126,5 +126,5 @@ The redirect cache uses the Workers Cache API, which only works on a custom doma
 
 ## Roadmap
 
-Accounts and API keys, a dashboard rebuild (Vite 8, Tailwind 4), an MCP server for agents, then
+Accounts and API keys, a dashboard redesign, an MCP server for agents, then
 custom domains and smart routing.
