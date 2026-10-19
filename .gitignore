@@ -1,8 +1,11 @@
 # Dependencies
 node_modules/
 
-# Environment
+# Environment and local secrets
 .env
+*.env
+secret.env*
+.dev.vars
 .env.local
 .env.*.local
 
