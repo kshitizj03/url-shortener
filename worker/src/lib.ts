@@ -1,16 +1,20 @@
-// Crockford base32, lowercase: no i, l, o or u, so there is only one of each look-alike pair
-// (0/o, 1/i/l). Codes survive being printed, read aloud or auto-capitalized.
-const ALPHABET = '0123456789abcdefghjkmnpqrstvwxyz';
+const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
 // Slugs that would shadow real routes or look official. Matching is case-insensitive.
 export const RESERVED = new Set([
   'api', 'app', 'assets', 'health', 'admin', 'login', 'static', 'favicon', 'www', 'abuse', 'about', 'privacy', 'terms',
 ]);
 
-/** Random slug. 8 chars = 32^8 = 2^40 (~1.1 trillion) codes; callers grow the length on collision. */
-export function randomSlug(length = 8): string {
-  // 256 is a multiple of 32, so `& 31` maps bytes to characters with no bias.
-  return Array.from(crypto.getRandomValues(new Uint8Array(length)), (b) => ALPHABET[b & 31]).join('');
+/** Random base62 slug, case-sensitive. 7 chars = 62^7 (~3.5 trillion) codes; callers grow the length on collision. */
+export function randomSlug(length = 7): string {
+  let out = '';
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length * 2))) {
+      // 248 = 62 * 4: bytes above it are skipped so every character is equally likely.
+      if (b < 248 && out.length < length) out += ALPHABET[b % 62];
+    }
+  }
+  return out;
 }
 
 /** 256-bit token, base64url. Shown to the creator once, only its hash is stored. */

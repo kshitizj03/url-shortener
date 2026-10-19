@@ -6,7 +6,7 @@ import { parseUserAgent, randomSlug, rateLimitKey } from '../src/lib';
 
 const ORIGIN = 'https://sho.rt';
 const HOUR_MS = 3_600_000;
-const SLUG_8 = /^[0-9abcdefghjkmnpqrstvwxyz]{8}$/;
+const SLUG_7 = /^[0-9a-zA-Z]{7}$/;
 const CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36';
 const EDGE = `${CHROME} Edg/141.0`;
 const IPHONE_SAFARI = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
@@ -41,9 +41,9 @@ const errorOf = async (res: Response) => (await res.json<{ error: string }>()).e
 afterEach(() => vi.restoreAllMocks());
 
 describe('slugs', () => {
-  it('are 8 chars of lowercase Crockford base32, with a token and short URL', async () => {
+  it('are 7 chars of base62, with a token and short URL', async () => {
     const link = await createOk();
-    expect(link.slug).toMatch(SLUG_8);
+    expect(link.slug).toMatch(SLUG_7);
     expect(link.shortUrl).toBe(`${ORIGIN}/${link.slug}`);
     expect(link.manageToken.length).toBeGreaterThanOrEqual(43);
   });
@@ -51,36 +51,40 @@ describe('slugs', () => {
   it('are not sequential', async () => {
     const a = await createOk();
     const b = await createOk();
-    expect(a.slug.slice(0, 7)).not.toBe(b.slug.slice(0, 7));
+    expect(a.slug.slice(0, 6)).not.toBe(b.slug.slice(0, 6));
   });
 
-  it('resolve case-insensitively, so typed or auto-capitalized links still work', async () => {
-    const link = await createOk();
-    const res = await call(`/${link.slug.toUpperCase()}`);
-    expect(res.status).toBe(302);
-    expect(res.headers.get('Location')).toBe(link.url);
+  it('are case-sensitive: a wrong-case visit is a 404', async () => {
+    const link = await createOk({ url: 'https://example.com', slug: 'aBc123x' });
+    expect((await call(`/${link.slug}`)).status).toBe(302);
+    expect((await call('/ABC123X')).status).toBe(404);
   });
 
-  it('custom slugs are unique ignoring case, so "MY-LAUNCH" cannot impersonate "my-launch"', async () => {
+  it('cannot be registered as a case variant of an existing slug', async () => {
     expect((await createOk({ url: 'https://example.com', slug: 'my-launch' })).slug).toBe('my-launch');
-    expect((await create({ url: 'https://evil.example', slug: 'MY-LAUNCH' })).status).toBe(409);
-    expect((await call('/My-Launch')).headers.get('Location')).toBe('https://example.com/');
+    const res = await create({ url: 'https://evil.example', slug: 'MY-LAUNCH' });
+    expect(res.status).toBe(409);
+    expect((await call('/MY-LAUNCH')).status).toBe(404); // never someone else's link
+
+    const random = await createOk();
+    const swapped = [...random.slug].map((ch) => (ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase())).join('');
+    expect((await create({ url: 'https://evil.example', slug: swapped })).status).toBe(409);
   });
 
-  it('grow one character when the 8-char attempts collide', async () => {
-    // Force the first three random draws to the same slug: the first link takes it, the next
-    // link collides three times and must fall back to 9 chars.
+  it('grow one character when the 7-char attempts collide', async () => {
+    // Force every 7-char draw to the same slug: the first link takes it, the next link
+    // collides three times and must fall back to 8 chars. (A 7-char slug draws 14 bytes.)
     const values = vi.spyOn(crypto, 'getRandomValues');
     values.mockImplementation(<T extends ArrayBufferView | null>(array: T): T => {
       const bytes = array as unknown as Uint8Array;
-      if (bytes.length === 8) bytes.fill(0);
-      else for (let i = 0; i < bytes.length; i++) bytes[i] = i; // tokens and 9-char slugs
+      if (bytes.length === 14) bytes.fill(0);
+      else for (let i = 0; i < bytes.length; i++) bytes[i] = i; // tokens and 8-char slugs
       return array;
     });
     const first = await createOk();
-    expect(first.slug).toBe('00000000');
+    expect(first.slug).toBe('0000000');
     const second = await createOk();
-    expect(second.slug).toHaveLength(9);
+    expect(second.slug).toHaveLength(8);
   });
 });
 
@@ -90,7 +94,7 @@ describe('create validation', () => {
     [{ url: 'ftp://example.com/file' }, 'http'],
     [{ url: 'not a url' }, 'http'],
     [{ url: `https://example.com/${'a'.repeat(2100)}` }, 'too long'],
-    [{ url: `${ORIGIN}/abc12345` }, 'this shortener'],
+    [{ url: `${ORIGIN}/abc1234` }, 'this shortener'],
     [{ url: 'https://paypal.com@evil.example/login' }, 'credentials'],
     [{ url: 'http://192.168.1.1/admin' }, 'raw IP'],
     [{ url: 'http://[::1]:8080/' }, 'raw IP'],
@@ -285,10 +289,10 @@ describe('admin token', () => {
 });
 
 describe('lib', () => {
-  it('randomSlug uses exactly the 32 Crockford characters', () => {
+  it('randomSlug uses all 62 base62 characters', () => {
     const all = Array.from({ length: 2000 }, () => randomSlug()).join('');
-    expect(all).toMatch(/^[0-9abcdefghjkmnpqrstvwxyz]+$/);
-    expect(new Set(all).size).toBe(32);
+    expect(all).toMatch(/^[0-9a-zA-Z]+$/);
+    expect(new Set(all).size).toBe(62);
   });
 
   it('rateLimitKey buckets IPv6 by /64 and leaves IPv4 alone', () => {

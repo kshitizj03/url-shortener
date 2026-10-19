@@ -12,14 +12,14 @@ Worker and one D1 (SQLite) database: no servers, no Redis, and it fits the free 
              ┌──────────────── one Cloudflare Worker ────────────────┐
 GET /        │ static assets (React app), served without running code │
              │                                                        │
-GET /k7m2qx9a│ Cache API (5 min) ──miss──► D1 links ──► 302 redirect  │
+GET /aB3xY9z │ Cache API (5 min) ──miss──► D1 links ──► 302 redirect  │
              │                    after the response: ctx.waitUntil ──► D1 clicks
              │                                                        │
 /api/links   │ Hono + Zod: create, stats, delete                      │
              └────────────────────────────────────────────────────────┘
 ```
 
-- **Readable, unguessable slugs.** 8 random characters, or a custom slug. See [ID design](#id-design).
+- **Short, unguessable slugs.** 7 random base62 characters, or a custom slug. See [ID design](#id-design).
 - **The redirect never waits on analytics.** The click row is written after the 302 is sent.
 - **Bot-filtered stats.** Link previews from Slack, X, WhatsApp, Discord and scripts are counted
   separately instead of inflating clicks.
@@ -35,15 +35,17 @@ GET /k7m2qx9a│ Cache API (5 min) ──miss──► D1 links ──► 302 re
 Each link has two IDs. The internal one is SQLite's integer primary key, and it's never exposed.
 The public one is the slug.
 
-- **Alphabet:** lowercase [Crockford base32](https://www.crockford.com/base32.html) (`0-9a-z`
-  without `i l o u`). Only one of each look-alike pair exists, so a slug survives being printed,
-  read aloud or typed from a slide.
-- **Case-insensitive:** the slug column is `UNIQUE COLLATE NOCASE`. `/K7M2QX9A` works, and
-  `My-Launch` can't be registered next to `my-launch` to impersonate it.
-- **Capacity:** 32^8 = 2^40 ≈ 1.1 trillion codes. With a million links, a new random slug collides
-  about once in a million tries. The unique index catches it, the insert retries, and after 3
-  collisions the slug grows to 9 characters. So creation never fails, and length grows only if it
-  ever has to.
+- **Case-sensitive base62** (`0-9a-zA-Z`), the same convention as Bitly. `/aB3xY9z` and
+  `/ab3xy9z` are different URLs. Short links are almost always clicked or scanned rather than
+  typed, so the shortest code wins over typo-friendliness.
+- **Unique ignoring case:** a second index, `UNIQUE (lower(slug))`, means no two links may differ
+  only by case. Nobody can register `MY-LAUNCH` next to `my-launch`, or `AB3XY9Z` next to
+  `aB3xY9z`. A wrong-case visit gets a 404, never someone else's link. It's enforced by the
+  database, so there's no race between check and insert.
+- **Capacity:** 62^7 ≈ 3.5 trillion codes, but the case rule leaves 36^7 ≈ 78 billion usable
+  ones. With a million links, a new random slug collides about once in 78,000 tries. The insert
+  retries, and after 3 collisions the slug grows to 8 characters, so creation never fails and
+  length grows only if it ever has to.
 - **Why not Snowflake (V1)?** Snowflake solves ID generation across many writers without
   coordination. This system has one database, so it already has unique IDs. Using a Snowflake as
   the public code also made codes sequential, so every link could be enumerated.
@@ -109,7 +111,7 @@ The redirect cache uses the Workers Cache API, which only works on a custom doma
 | V1 | Problem | V2 |
 |---|---|---|
 | Redis cache-aside | A cache hit still queried Postgres for `id` and `expiresAt`, so the cache saved nothing | The cache stores the whole record, and its TTL is capped by the link's expiry |
-| Snowflake ID as the short code | 10 characters, consecutive, so every link was enumerable | Random, case-insensitive Crockford slugs |
+| Snowflake ID as the short code | 10 characters, consecutive, so every link was enumerable | Random 7-char base62, unique ignoring case |
 | Redis Pub/Sub to an analytics worker | Clicks were lost while the worker was down, and doubled with 2 workers | Insert after the response with `waitUntil` |
 | Sorted-set rate limiter | Check and add were separate round trips (race) | One indexed D1 count |
 | Public `/analytics/:code` | Anyone could read any link's stats, and it loaded every click into memory | Token-protected, aggregated in SQL |

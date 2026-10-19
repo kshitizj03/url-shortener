@@ -2,13 +2,16 @@
 
 CREATE TABLE links (
   id           INTEGER PRIMARY KEY,
-  slug         TEXT    NOT NULL UNIQUE COLLATE NOCASE,   -- 'My-Launch' and 'my-launch' are the same link
+  slug         TEXT    NOT NULL UNIQUE,   -- case-sensitive: /aB3xY9z and /ab3xy9z are different URLs
   url          TEXT    NOT NULL,
   token_hash   TEXT    NOT NULL,          -- sha256 of the manage token, the token itself is never stored
   creator_hash TEXT    NOT NULL,          -- sha256 of salt + IP bucket, rate limiting only; blanked after an hour
   created_at   INTEGER NOT NULL,
   expires_at   INTEGER
 );
+-- No two links may differ only by case, so nobody can register 'MY-LAUNCH' next to 'my-launch',
+-- or 'AB3XY9Z' next to 'aB3xY9z'. A wrong-case visit gets a 404, never someone else's link.
+CREATE UNIQUE INDEX links_slug_nocase ON links (lower(slug));
 CREATE INDEX links_creator_time ON links (creator_hash, created_at);
 
 CREATE TABLE clicks (

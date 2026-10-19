@@ -40,8 +40,7 @@ const createBody = z.object({
   expiresAt: z.iso.datetime({ offset: true, error: 'expiresAt must be an ISO date' }).optional(),
 });
 
-// Lowercased because slugs are case-insensitive: /AbC and /abc must share one cache entry.
-const cacheKey = (c: Ctx, slug: string) => new Request(new URL(`/__link/${slug.toLowerCase()}`, c.req.url));
+const cacheKey = (c: Ctx, slug: string) => new Request(new URL(`/__link/${slug}`, c.req.url));
 
 /**
  * Looks up a link by slug and checks the bearer token: the link's own manage token, or the
@@ -117,12 +116,13 @@ app.post('/api/links', zValidator('json', createBody, (result, c) => {
   const tokenHash = await sha256(token);
   const insert = c.env.DB.prepare(
     `INSERT INTO links (slug, url, token_hash, creator_hash, created_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (slug) DO NOTHING`,
+     VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, // either the exact slug or a case variant exists
   );
 
-  // Random slugs: 3 tries at 8 chars, then 9. At a million links a collision is ~1 in a million,
-  // so growing is a safety valve, not something that happens in practice.
-  const candidates = customSlug ? [customSlug] : [8, 8, 8, 9, 9].map((n) => randomSlug(n));
+  // Random slugs: 3 tries at 7 chars, then 8. The case-insensitive unique index leaves 36^7
+  // (~78 billion) usable codes, so at a million links a collision is ~1 in 78,000 tries.
+  // Growing is a safety valve, not something that happens in practice.
+  const candidates = customSlug ? [customSlug] : [7, 7, 7, 8, 8].map((n) => randomSlug(n));
   let slug: string | null = null;
   for (const candidate of candidates) {
     const { meta } = await insert.bind(candidate, url, tokenHash, creator, now, expires).run();
