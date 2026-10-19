@@ -10,8 +10,7 @@
     {
       "binding": "DB",
       "database_name": "url-shortener",
-      // Replace with the id printed by `wrangler d1 create url-shortener`.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "4f2e8794-40e0-4448-b665-c65d4425603c",
       "migrations_dir": "migrations"
     }
   ],
