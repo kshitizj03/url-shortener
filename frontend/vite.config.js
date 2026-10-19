@@ -7,11 +7,8 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      '/api': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ''),
-      },
+      // `npm run dev` in ../worker serves the API on 8787.
+      '/api': 'http://localhost:8787',
     },
   },
 })

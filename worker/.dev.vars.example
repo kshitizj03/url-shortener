@@ -1,0 +1,2 @@
+# Copy to .dev.vars for local dev. In production: wrangler secret put IP_SALT
+IP_SALT=any-long-random-string

@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "url-shortener",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // Assets are served first (free, no Worker invocation). Anything that is not a
+  // built file, like /aB3xY9z or /api/links, falls through to the Worker.
+  "assets": { "directory": "../frontend/dist", "binding": "ASSETS" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "url-shortener",
+      // Replace with the id printed by `wrangler d1 create url-shortener`.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    // Max links one IP can create per hour.
+    "CREATE_LIMIT_PER_HOUR": "20"
+  },
+  "observability": { "enabled": true }
+}
