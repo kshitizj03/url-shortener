@@ -98,7 +98,7 @@ function AnalyticsDashboard({ links, onDelete }) {
       {stats && (
         <div className="space-y-6">
           <div className="grid gap-4 sm:grid-cols-2">
-            <div className="p-6 bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl text-white">
+            <div className="p-6 bg-linear-to-br from-blue-500 to-blue-600 rounded-xl text-white">
               <p className="text-sm opacity-90">Human clicks, last {stats.days} days</p>
               <p className="text-4xl font-bold mt-1">{stats.clicks}</p>
             </div>
