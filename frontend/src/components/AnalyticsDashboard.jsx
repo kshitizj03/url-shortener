@@ -122,13 +122,17 @@ function AnalyticsDashboard({ links, onDelete }) {
               </LineChart>
             </ResponsiveContainer>
             </div>
-            <table className="sr-only">
-              <caption>Human clicks per day, last {stats.days} days</caption>
-              <thead><tr><th scope="col">Day</th><th scope="col">Clicks</th></tr></thead>
-              <tbody>
-                {stats.daily.map((d) => <tr key={d.day}><td>{d.day}</td><td>{d.clicks}</td></tr>)}
-              </tbody>
-            </table>
+            {/* sr-only goes on a wrapper: tables ignore its 1px height, and an unclipped ~800px
+                table left a blank scrollable area under the footer. */}
+            <div className="sr-only">
+              <table>
+                <caption>Human clicks per day, last {stats.days} days</caption>
+                <thead><tr><th scope="col">Day</th><th scope="col">Clicks</th></tr></thead>
+                <tbody>
+                  {stats.daily.map((d) => <tr key={d.day}><td>{d.day}</td><td>{d.clicks}</td></tr>)}
+                </tbody>
+              </table>
+            </div>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
