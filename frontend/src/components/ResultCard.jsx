@@ -68,7 +68,7 @@ function ResultCard({ result, onReset }) {
           value={result.shortUrl} 
           size={180}
           level="M"
-          includeMargin={true}
+          marginSize={2}
         />
       </div>
 
@@ -76,12 +76,12 @@ function ResultCard({ result, onReset }) {
       <div className="p-4 bg-gray-50 rounded-lg border border-gray-200">
         <h3 className="font-medium text-gray-700 mb-2">Details</h3>
         <dl className="grid grid-cols-2 gap-2 text-sm">
-          <dt className="text-gray-500">Short Code:</dt>
-          <dd className="font-mono">{result.shortCode}</dd>
-          
+          <dt className="text-gray-500">Slug:</dt>
+          <dd className="font-mono">{result.slug}</dd>
+
           <dt className="text-gray-500">Original URL:</dt>
-          <dd className="truncate" title={result.longUrl}>{result.longUrl}</dd>
-          
+          <dd className="truncate" title={result.url}>{result.url}</dd>
+
           <dt className="text-gray-500">Created:</dt>
           <dd>{new Date(result.createdAt).toLocaleString()}</dd>
           
@@ -92,6 +92,10 @@ function ResultCard({ result, onReset }) {
             </>
           )}
         </dl>
+        <p className="mt-3 text-xs text-gray-500">
+          This browser keeps the link's private manage token, so you can see its stats under My Links.
+          Clearing site data loses it.
+        </p>
       </div>
 
       {/* Actions */}

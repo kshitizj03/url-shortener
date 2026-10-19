@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "url-shortener",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // Assets are served first (free, no Worker invocation). Anything that is not a
+  // built file, like /aB3xY9z or /api/links, falls through to the Worker.
+  "assets": { "directory": "../frontend/dist", "binding": "ASSETS" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "url-shortener",
+      "database_id": "4f2e8794-40e0-4448-b665-c65d4425603c",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    // Max links one IP can create per hour.
+    "CREATE_LIMIT_PER_HOUR": "20"
+  },
+  // Hourly: blank rate-limit hashes older than an hour (see forgetCreators).
+  "triggers": { "crons": ["0 * * * *"] },
+  // Secrets, set with `wrangler secret put <NAME>` (local dev reads .dev.vars instead):
+  //   IP_SALT            required, any long random string
+  //   SAFE_BROWSING_KEY  required, link creation fails closed without it
+  //   ADMIN_TOKEN        optional, 32+ chars, lets the operator view or delete any link
+  "observability": { "enabled": true }
+}

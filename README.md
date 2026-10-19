@@ -1,136 +1,130 @@
 # URL Shortener
 
-A production-grade URL shortener built on distributed systems principles. Converts long URLs into short codes, tracks click analytics, and handles high redirect traffic — engineered the way real systems are built.
+Short links with bot-filtered, privacy-friendly click analytics. The whole thing is one Cloudflare
+Worker and one D1 (SQLite) database: no servers, no Redis, and it fits the free plan.
 
-> Built to demonstrate core distributed systems concepts: conflict-free ID generation, cache-aside pattern, async event processing, and sliding window rate limiting.
+**Live:** https://url-shortener.kshitizj.workers.dev
 
----
+> **V1** (Express + Prisma + Postgres + Redis, Snowflake IDs) is preserved at tag
+> [`v1.0.0`](https://github.com/kshitizj03/url-shortener/tree/v1.0.0) and branch `v1`. Why V2 replaced it is under [What changed from V1](#what-changed-from-v1).
 
-## Architecture
+## How it works
 
 ```
-SHORTEN FLOW
-─────────────────────────────────────────────────────────────
-Long URL ──► Snowflake ID Generator ──► Base62 Encoder ──► PostgreSQL
-                                              │
-                                         Short Code
-                                         (e.g. aX9kRm)
-
-REDIRECT FLOW
-─────────────────────────────────────────────────────────────
-GET /aX9kRm ──► Redis Cache ──► HIT  ──► 302 Redirect
-                    │
-                   MISS
-                    │
-               PostgreSQL ──► cache result ──► 302 Redirect
-                    │
-                    └──► publish click event (non-blocking)
-                                    │
-                            Redis Pub/Sub Channel
-                                    │
-                            Analytics Worker (async)
-                                    │
-                              PostgreSQL clicks table
+             ┌──────────────── one Cloudflare Worker ────────────────┐
+GET /        │ static assets (React app), served without running code │
+             │                                                        │
+GET /aB3xY9z │ Cache API (5 min) ──miss──► D1 links ──► 302 redirect  │
+             │                    after the response: ctx.waitUntil ──► D1 clicks
+             │                                                        │
+/api/links   │ Hono + Zod: create, stats, delete                      │
+             └────────────────────────────────────────────────────────┘
 ```
 
----
+- **Short, unguessable slugs.** 7 random base62 characters, or a custom slug. See [ID design](#id-design).
+- **The redirect never waits on analytics.** The click row is written after the 302 is sent.
+- **Bot-filtered stats.** Link previews from Slack, X, WhatsApp, Discord and scripts are counted
+  separately instead of inflating clicks.
+- **No IPs stored.** Country comes from Cloudflare's edge. Rate limiting uses a salted hash,
+  deleted after an hour.
+- **Unsafe URLs are refused.** Every new link is checked against Google Safe Browsing.
+- **Manage tokens instead of accounts (for now).** Creating a link returns a secret token. Only its
+  SHA-256 is stored. Stats and delete need it, and the web app keeps it in the browser under My Links.
+- **Rate limit:** 20 create attempts per IP per hour (IPv6 counted per /64, `CREATE_LIMIT_PER_HOUR`).
+  Attempts are counted, not links, so flagged URLs, taken slugs and deleted links all use budget.
 
-## Features
+## ID design
 
-- **Snowflake ID Generation** — distributed 64-bit IDs, no DB coordination, no collisions
-- **Base62 Encoding** — clean 6–8 character short codes from `a-zA-Z0-9`
-- **Cache-Aside Pattern** — Redis serves hot URLs in under 1ms, PostgreSQL is the source of truth
-- **Async Analytics** — click events published to Redis Pub/Sub; redirect latency is never affected by analytics writes
-- **Sliding Window Rate Limiter** — 10 shorten requests per IP per minute, enforced via Redis sorted sets
-- **QR Code Generation** — instant QR codes for every shortened link
-- **API Key Auth** — protected delete operations
+Each link has two IDs. The internal one is SQLite's integer primary key, and it's never exposed.
+The public one is the slug.
 
----
+- **Case-sensitive base62** (`0-9a-zA-Z`), the same convention as Bitly. `/aB3xY9z` and
+  `/ab3xy9z` are different URLs. Short links are almost always clicked or scanned rather than
+  typed, so the shortest code wins over typo-friendliness.
+- **Unique ignoring case:** a second index, `UNIQUE (lower(slug))`, means no two links may differ
+  only by case. Nobody can register `MY-LAUNCH` next to `my-launch`, or `AB3XY9Z` next to
+  `aB3xY9z`. A wrong-case visit gets a 404, never someone else's link. It's enforced by the
+  database, so there's no race between check and insert.
+- **Capacity:** 62^7 ≈ 3.5 trillion codes, but the case rule leaves 36^7 ≈ 78 billion usable
+  ones. With a million links, a new random slug collides about once in 78,000 tries. The insert
+  retries, and after 3 collisions the slug grows to 8 characters, so creation never fails and
+  length grows only if it ever has to.
+- **Why not Snowflake (V1)?** Snowflake solves ID generation across many writers without
+  coordination. This system has one database, so it already has unique IDs. Using a Snowflake as
+  the public code also made codes sequential, so every link could be enumerated.
 
-## Tech Stack
+## Security
 
-| Layer | Technology |
-|---|---|
-| Backend | Node.js, Express |
-| Database | PostgreSQL, Prisma ORM |
-| Cache + Queue | Redis (cache-aside + Pub/Sub) |
-| Frontend | React 18, Tailwind CSS, Vite |
-| Charts | Recharts |
-| Containerization | Docker, docker-compose |
+- Validation: `http(s)` only, at most 2048 characters, stored in normalized form (punycode hosts,
+  no stray control characters). Rejected: embedded credentials (`https://paypal.com@evil.example`),
+  raw IPs, `localhost` and other non-public hosts, links to the shortener itself, and reserved slugs.
+- Google Safe Browsing lookup on create. It **fails closed**: if the key is missing or Google is
+  unreachable, creation returns 503 instead of skipping the check.
+- Manage tokens are 256-bit random values. Only their SHA-256 is stored, and comparisons are
+  constant-time. An optional `ADMIN_TOKEN` (32+ characters) lets the operator take down any link.
+- Security headers everywhere: a strict CSP, `frame-ancestors 'none'`, HSTS and `nosniff`, set by
+  Hono `secureHeaders` for the Worker and by [`frontend/public/_headers`](frontend/public/_headers)
+  for the app.
+- `Cross-Origin-Resource-Policy: same-origin` on the API only. Redirects omit it so a short link
+  works as an `<img>` source on other sites.
+- 8 KB body limit on the API. All SQL is parameterized. Errors are generic (HTML for browsers,
+  JSON for the API).
+- Known limits: the redirect cache can serve a deleted link for up to 5 minutes in other data
+  centers. Manage tokens live in `localStorage` until accounts exist (React escaping and the CSP
+  guard against XSS reading them).
 
----
+Report abuse by opening an issue. Flagged links are taken down with the admin token.
 
-## Getting Started
+## API
 
-### Prerequisites
-- Docker and Docker Compose
+| Method | Path | Auth | |
+|---|---|---|---|
+| `POST` | `/api/links` | none | `{ url, slug?, expiresAt? }` → `201 { slug, shortUrl, manageToken, ... }` |
+| `GET` | `/api/links/:slug` | `Bearer <manageToken or ADMIN_TOKEN>` | last 30 days: clicks, bot hits, per-day series, top countries / devices / browsers / referrers |
+| `DELETE` | `/api/links/:slug` | `Bearer <manageToken or ADMIN_TOKEN>` | deletes the link and its clicks |
+| `GET` | `/:slug` | none | `302` to the target, `404` / `410` HTML page otherwise |
+| `GET` | `/api/health` | none | checks D1 |
 
-### Run with Docker
+## Run locally
 
 ```bash
-git clone https://github.com/kshitizj03/url-shortener
-cd url-shortener
-
-cp backend/.env.example backend/.env
-# Add your settings to backend/.env
-
-docker-compose up --build
+cd frontend && npm install && npm run build && cd ..
+cd worker && npm install
+cp .dev.vars.example .dev.vars   # sets URL_SCREENING=off, so no Google key is needed locally
+npm run dev          # applies local D1 migrations, serves app + API on http://localhost:8787
+npm test             # tests run inside the Workers runtime against a real local D1
+cd ../frontend && npm test   # API client tests (Node's built-in runner)
 ```
 
-- Frontend: http://localhost:3000
-- Backend API: http://localhost:8000
+For frontend hot reload, run `npm run dev` in `frontend/` too (port 3000, proxies `/api` to 8787).
 
-### Local Development
+## Deploy
 
-**Backend**
 ```bash
-cd backend
-npm install
-cp .env.example .env
-npx prisma db push
-npm run dev
+cd worker
+npx wrangler d1 create url-shortener      # put the printed database_id in wrangler.jsonc
+npx wrangler secret put IP_SALT           # any long random string
+npx wrangler secret put SAFE_BROWSING_KEY # free key: Google Cloud console > Safe Browsing API
+npx wrangler secret put ADMIN_TOKEN       # optional, 32+ random characters, for takedowns
+cd ../frontend && npm run build && cd ../worker
+npm run deploy
 ```
 
-**Analytics Worker** (separate terminal)
-```bash
-cd backend
-npm run worker
-```
+The redirect cache uses the Workers Cache API, which only works on a custom domain. On
+`*.workers.dev` every redirect reads D1 (still within the free plan's 5M reads a day).
 
-**Frontend**
-```bash
-cd frontend
-npm install
-cp .env.example .env
-npm run dev
-```
+## What changed from V1
 
----
+| V1 | Problem | V2 |
+|---|---|---|
+| Redis cache-aside | A cache hit still queried Postgres for `id` and `expiresAt`, so the cache saved nothing | The cache stores the whole record, and its TTL is capped by the link's expiry |
+| Snowflake ID as the short code | 10 characters, consecutive, so every link was enumerable | Random 7-char base62, unique ignoring case |
+| Redis Pub/Sub to an analytics worker | Clicks were lost while the worker was down, and doubled with 2 workers | Insert after the response with `waitUntil` |
+| Sorted-set rate limiter | Check and add were separate round trips (race) | One indexed D1 count |
+| Public `/analytics/:code` | Anyone could read any link's stats, and it loaded every click into memory | Token-protected, aggregated in SQL |
+| 4 processes (API, worker, Postgres, Redis) | Never deployed | 1 Worker + 1 D1 database |
 
-## How It Works
+## Roadmap
 
-**Snowflake ID — conflict-free ID generation**
-
-Every short code starts as a 64-bit integer split into three parts:
-
-```
-┌──────────┬────────────────┬────────────┬──────────────┐
-│  1 bit   │   41 bits      │  10 bits   │   12 bits    │
-│  unused  │  timestamp ms  │ machine ID │   sequence   │
-└──────────┴────────────────┴────────────┴──────────────┘
-```
-
-The timestamp ensures uniqueness over time, machine ID allows multiple servers to generate IDs simultaneously without coordination, and the sequence handles 4096 IDs per millisecond per server. The result is Base62-encoded into a short, readable code — no database lookup needed before insertion.
-
-**Cache-aside — sub-millisecond redirects**
-
-Every redirect checks Redis first. On a miss, PostgreSQL is queried and the result is stored in Redis with a 24-hour TTL. Popular links are served entirely from memory.
-
-**Async analytics — hot path stays fast**
-
-On every redirect, a click event is published to a Redis channel and the 302 response is returned immediately. A separate worker process subscribes to the channel and writes to PostgreSQL asynchronously. A slow analytics write never delays a user's redirect.
-
-**Sliding window rate limiter — abuse prevention**
-
-Uses Redis sorted sets keyed by IP address. On each request, entries older than 60 seconds are removed, the remaining count is checked, and a new entry is added if under the limit. Shared Redis means the limit is enforced consistently across multiple server instances.
-
+Accounts and API keys, a dashboard rebuild (Vite 8, Tailwind 4), an MCP server for agents, then
+custom domains and smart routing.
