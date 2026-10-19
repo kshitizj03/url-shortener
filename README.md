@@ -100,6 +100,13 @@ For frontend hot reload, run `npm run dev` in `frontend/` too (port 3000, proxie
 
 ## Deploy
 
+Every push to `main` deploys automatically once CI passes (the `deploy` job in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml)): build, D1 migrations, `wrangler deploy`,
+then a smoke test that the live site is up and serving the new bundle. It needs two repo
+secrets, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. Roll back with `npx wrangler rollback`.
+
+First-time setup, or a manual deploy:
+
 ```bash
 cd worker
 npx wrangler d1 create url-shortener      # put the printed database_id in wrangler.jsonc

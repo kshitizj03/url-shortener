@@ -2,8 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main, v2]
+    branches: [main]
   pull_request:
+
+# Least privilege: the jobs only read the repo. Cloudflare access comes from the secrets below.
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -28,3 +32,61 @@ jobs:
           cp .dev.vars.example .dev.vars
           npm run typecheck
           npm test
+
+  # Deploys every push to main, but only once the tests above pass. PRs never deploy.
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production # add "required reviewers" here in GitHub to approve each deploy
+      url: https://url-shortener.kshitizj.workers.dev
+    concurrency:
+      group: production
+      cancel-in-progress: false # never stop a deploy halfway; queue the next one instead
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SITE_URL: https://url-shortener.kshitizj.workers.dev
+    steps:
+      - name: Check Cloudflare secrets are set
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::Add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm run build
+      - name: Install worker dependencies
+        working-directory: worker
+        run: npm ci
+      # Before the deploy, so new code never runs against an old schema. Migrations must stay
+      # backward compatible with the live code for the few seconds until the deploy lands.
+      - name: Apply D1 migrations
+        working-directory: worker
+        run: npx wrangler d1 migrations apply DB --remote
+      - name: Deploy Worker
+        working-directory: worker
+        run: npx wrangler deploy
+      # Fails the job (red X on the commit) if the live site is down or still serving the old
+      # frontend. Roll back with `npx wrangler rollback` from worker/.
+      - name: Smoke test the live site
+        run: |
+          expected=$(grep -o 'assets/index-[A-Za-z0-9_-]*\.js' frontend/dist/index.html)
+          for attempt in 1 2 3 4 5 6; do
+            health=$(curl -s -o /dev/null -w '%{http_code}' "$SITE_URL/api/health" || true)
+            served=$(curl -s "$SITE_URL/" | grep -o 'assets/index-[A-Za-z0-9_-]*\.js' || true)
+            if [ "$health" = 200 ] && [ "$served" = "$expected" ]; then
+              echo "Live: /api/health 200, serving $served"
+              exit 0
+            fi
+            echo "Attempt $attempt: health=$health served=${served:-none} expected=$expected"
+            sleep 10
+          done
+          echo "::error::Deployed site failed its smoke test. Roll back with: cd worker && npx wrangler rollback"
+          exit 1
