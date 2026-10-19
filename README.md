@@ -3,6 +3,8 @@
 Short links with bot-filtered, privacy-friendly click analytics. The whole thing is one Cloudflare
 Worker and one D1 (SQLite) database: no servers, no Redis, and it fits the free plan.
 
+**Live:** https://url-shortener.kshitizj.workers.dev
+
 > **V1** (Express + Prisma + Postgres + Redis, Snowflake IDs) is preserved at tag
 > [`v1.0.0`](https://github.com/kshitizj03/url-shortener/tree/v1.0.0) and branch `v1`. Why V2 replaced it is under [What changed from V1](#what-changed-from-v1).
 
@@ -24,11 +26,12 @@ GET /aB3xY9z │ Cache API (5 min) ──miss──► D1 links ──► 302 re
 - **Bot-filtered stats.** Link previews from Slack, X, WhatsApp, Discord and scripts are counted
   separately instead of inflating clicks.
 - **No IPs stored.** Country comes from Cloudflare's edge. Rate limiting uses a salted hash,
-  which is blanked after an hour.
+  deleted after an hour.
 - **Unsafe URLs are refused.** Every new link is checked against Google Safe Browsing.
 - **Manage tokens instead of accounts (for now).** Creating a link returns a secret token. Only its
   SHA-256 is stored. Stats and delete need it, and the web app keeps it in the browser under My Links.
-- **Rate limit:** 20 links per IP per hour (IPv6 counted per /64), checked in D1 (`CREATE_LIMIT_PER_HOUR`).
+- **Rate limit:** 20 create attempts per IP per hour (IPv6 counted per /64, `CREATE_LIMIT_PER_HOUR`).
+  Attempts are counted, not links, so flagged URLs, taken slugs and deleted links all use budget.
 
 ## ID design
 
@@ -62,7 +65,10 @@ The public one is the slug.
 - Security headers everywhere: a strict CSP, `frame-ancestors 'none'`, HSTS and `nosniff`, set by
   Hono `secureHeaders` for the Worker and by [`frontend/public/_headers`](frontend/public/_headers)
   for the app.
-- 8 KB body limit on the API. All SQL is parameterized. Errors are generic.
+- `Cross-Origin-Resource-Policy: same-origin` on the API only. Redirects omit it so a short link
+  works as an `<img>` source on other sites.
+- 8 KB body limit on the API. All SQL is parameterized. Errors are generic (HTML for browsers,
+  JSON for the API).
 - Known limits: the redirect cache can serve a deleted link for up to 5 minutes in other data
   centers. Manage tokens live in `localStorage` until accounts exist (React escaping and the CSP
   guard against XSS reading them).
@@ -74,7 +80,7 @@ Report abuse by opening an issue. Flagged links are taken down with the admin to
 | Method | Path | Auth | |
 |---|---|---|---|
 | `POST` | `/api/links` | none | `{ url, slug?, expiresAt? }` → `201 { slug, shortUrl, manageToken, ... }` |
-| `GET` | `/api/links/:slug` | `Bearer <manageToken or ADMIN_TOKEN>` | clicks, bot hits, last 30 days, top countries / devices / browsers / referrers |
+| `GET` | `/api/links/:slug` | `Bearer <manageToken or ADMIN_TOKEN>` | last 30 days: clicks, bot hits, per-day series, top countries / devices / browsers / referrers |
 | `DELETE` | `/api/links/:slug` | `Bearer <manageToken or ADMIN_TOKEN>` | deletes the link and its clicks |
 | `GET` | `/:slug` | none | `302` to the target, `404` / `410` HTML page otherwise |
 | `GET` | `/api/health` | none | checks D1 |
@@ -87,6 +93,7 @@ cd worker && npm install
 cp .dev.vars.example .dev.vars   # sets URL_SCREENING=off, so no Google key is needed locally
 npm run dev          # applies local D1 migrations, serves app + API on http://localhost:8787
 npm test             # tests run inside the Workers runtime against a real local D1
+cd ../frontend && npm test   # API client tests (Node's built-in runner)
 ```
 
 For frontend hot reload, run `npm run dev` in `frontend/` too (port 3000, proxies `/api` to 8787).
