@@ -1,18 +1,16 @@
-const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+// Crockford base32, lowercase: no i, l, o or u, so there is only one of each look-alike pair
+// (0/o, 1/i/l). Codes survive being printed, read aloud or auto-capitalized.
+const ALPHABET = '0123456789abcdefghjkmnpqrstvwxyz';
 
-// Slugs that would shadow real routes or look official.
-export const RESERVED = new Set(['api', 'app', 'assets', 'health', 'admin', 'login', 'static', 'favicon']);
+// Slugs that would shadow real routes or look official. Matching is case-insensitive.
+export const RESERVED = new Set([
+  'api', 'app', 'assets', 'health', 'admin', 'login', 'static', 'favicon', 'www', 'abuse', 'about', 'privacy', 'terms',
+]);
 
-/** Random base62 slug. 62^7 is ~3.5 trillion, so collisions are rare and retried by the caller. */
-export function randomSlug(length = 7): string {
-  let out = '';
-  while (out.length < length) {
-    for (const b of crypto.getRandomValues(new Uint8Array(length * 2))) {
-      // 248 = 62 * 4: bytes above it are skipped so every character is equally likely.
-      if (b < 248 && out.length < length) out += ALPHABET[b % 62];
-    }
-  }
-  return out;
+/** Random slug. 8 chars = 32^8 = 2^40 (~1.1 trillion) codes; callers grow the length on collision. */
+export function randomSlug(length = 8): string {
+  // 256 is a multiple of 32, so `& 31` maps bytes to characters with no bias.
+  return Array.from(crypto.getRandomValues(new Uint8Array(length)), (b) => ALPHABET[b & 31]).join('');
 }
 
 /** 256-bit token, base64url. Shown to the creator once, only its hash is stored. */
@@ -24,6 +22,69 @@ export function randomToken(): string {
 export async function sha256(input: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Constant-time string comparison. Hashing first makes both sides the same length. */
+export async function secureEqual(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [x, y] = await Promise.all([a, b].map((v) => crypto.subtle.digest('SHA-256', enc.encode(v))));
+  return crypto.subtle.timingSafeEqual(x!, y!);
+}
+
+/**
+ * Rate-limit bucket for an IP. IPv6 users usually control a whole /64, so counting single
+ * addresses would let them rotate past the limit.
+ */
+export function rateLimitKey(ip: string): string {
+  if (!ip.includes(':')) return ip;
+  if (ip.includes('.')) return ip.slice(ip.lastIndexOf(':') + 1); // IPv4-mapped, e.g. ::ffff:1.2.3.4
+  const [head = '', tail = ''] = ip.toLowerCase().split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail ? tail.split(':') : [];
+  const groups = ip.includes('::') ? [...h, ...Array<string>(8 - h.length - t.length).fill('0'), ...t] : h;
+  return `${groups.slice(0, 4).map((g) => g.padStart(4, '0')).join(':')}::/64`;
+}
+
+/**
+ * Rules for a redirect target beyond "valid http(s) URL". Returns an error message, or null if allowed.
+ * `url` must already be parsed by `new URL`.
+ */
+export function targetProblem(url: URL, selfHost: string): string | null {
+  if (url.username || url.password) return 'URLs with embedded credentials are not allowed'; // https://paypal.com@evil.com
+  const host = url.hostname;
+  // Raw IPs are a strong phishing signal and cover private ranges (127.x, 10.x, 192.168.x, [::1]...).
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.startsWith('[')) return 'Links to raw IP addresses are not allowed';
+  if (!host.includes('.') || /\.(localhost|local|internal|lan|home|test|invalid)$/.test(host)) {
+    return 'Links must point to a public domain';
+  }
+  if (url.host === selfHost) return 'Cannot shorten a link to this shortener';
+  return null;
+}
+
+const THREAT_TYPES = ['MALWARE', 'SOCIAL_ENGINEERING', 'UNWANTED_SOFTWARE', 'POTENTIALLY_HARMFUL_APPLICATION'];
+
+/**
+ * Google Safe Browsing v4 lookup. Returns true if the URL is on a threat list.
+ * Throws on network errors or a non-200 answer, so the caller can fail closed.
+ */
+export async function isFlagged(url: string, apiKey: string): Promise<boolean> {
+  const res = await fetch(`https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${encodeURIComponent(apiKey)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client: { clientId: 'url-shortener', clientVersion: '2.0' },
+      threatInfo: {
+        threatTypes: THREAT_TYPES,
+        platformTypes: ['ANY_PLATFORM'],
+        threatEntryTypes: ['URL'],
+        threatEntries: [{ url }],
+      },
+    }),
+    signal: AbortSignal.timeout(3000),
+  });
+  if (!res.ok) throw new Error(`Safe Browsing answered ${res.status}`);
+  const body = await res.json<{ matches?: unknown[] }>();
+  return (body.matches?.length ?? 0) > 0;
 }
 
 // ponytail: keyword list, not a full UA database. Catches link-preview bots (Slack, X, WhatsApp,

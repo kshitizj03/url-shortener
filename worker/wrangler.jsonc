@@ -19,5 +19,11 @@
     // Max links one IP can create per hour.
     "CREATE_LIMIT_PER_HOUR": "20"
   },
+  // Hourly: blank rate-limit hashes older than an hour (see forgetCreators).
+  "triggers": { "crons": ["0 * * * *"] },
+  // Secrets, set with `wrangler secret put <NAME>` (local dev reads .dev.vars instead):
+  //   IP_SALT            required, any long random string
+  //   SAFE_BROWSING_KEY  required, link creation fails closed without it
+  //   ADMIN_TOKEN        optional, 32+ chars, lets the operator view or delete any link
   "observability": { "enabled": true }
 }

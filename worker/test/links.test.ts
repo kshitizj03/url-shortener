@@ -1,81 +1,177 @@
 import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { env } from 'cloudflare:workers';
-import { describe, expect, it } from 'vitest';
-import app from '../src/index';
-import { parseUserAgent, randomSlug } from '../src/lib';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import worker, { forgetCreators } from '../src/index';
+import { parseUserAgent, randomSlug, rateLimitKey } from '../src/lib';
 
 const ORIGIN = 'https://sho.rt';
 const HOUR_MS = 3_600_000;
+const SLUG_8 = /^[0-9abcdefghjkmnpqrstvwxyz]{8}$/;
 const CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36';
 const EDGE = `${CHROME} Edg/141.0`;
 const IPHONE_SAFARI = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
 
 let ipCounter = 0;
-const freshIp = () => `10.0.0.${++ipCounter}`;
+const freshIp = () => `10.0.${Math.floor(++ipCounter / 250)}.${ipCounter % 250}`;
 
-/** Calls the app and waits for waitUntil work (click inserts, cache puts) to finish. */
-async function call(path: string, init: RequestInit = {}, ip = freshIp()) {
+type CallOpts = { ip?: string; env?: Partial<Env> };
+
+/** Calls the Worker and waits for waitUntil work (click inserts, cache puts) to finish. */
+async function call(path: string, init: RequestInit = {}, opts: CallOpts = {}) {
   const headers = new Headers(init.headers);
-  headers.set('CF-Connecting-IP', ip);
+  headers.set('CF-Connecting-IP', opts.ip ?? freshIp());
   const ctx = createExecutionContext();
-  const res = await app.fetch(new Request(ORIGIN + path, { ...init, headers, redirect: 'manual' }), env, ctx);
+  const res = await worker.fetch(new Request(ORIGIN + path, { ...init, headers, redirect: 'manual' }), { ...env, ...opts.env }, ctx);
   await waitOnExecutionContext(ctx);
   return res;
 }
 
-async function create(body: object, ip?: string) {
-  return call('/api/links', { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } }, ip);
-}
+const post = (body: unknown) => ({ method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body), headers: { 'Content-Type': 'application/json' } });
+const create = (body: unknown, opts?: CallOpts) => call('/api/links', post(body), opts);
 
 async function createOk(body: object = { url: 'https://example.com/a/long/path?x=1' }) {
   const res = await create(body);
   expect(res.status).toBe(201);
-  return res.json<{ slug: string; shortUrl: string; manageToken: string; expiresAt: string | null }>();
+  return res.json<{ slug: string; shortUrl: string; url: string; manageToken: string; expiresAt: string | null }>();
 }
 
 const auth = (token: string) => ({ headers: { Authorization: `Bearer ${token}` } });
+const errorOf = async (res: Response) => (await res.json<{ error: string }>()).error;
 
-describe('create', () => {
-  it('returns a random 7-char slug, short URL and manage token', async () => {
+afterEach(() => vi.restoreAllMocks());
+
+describe('slugs', () => {
+  it('are 8 chars of lowercase Crockford base32, with a token and short URL', async () => {
     const link = await createOk();
-    expect(link.slug).toMatch(/^[0-9a-zA-Z]{7}$/);
+    expect(link.slug).toMatch(SLUG_8);
     expect(link.shortUrl).toBe(`${ORIGIN}/${link.slug}`);
     expect(link.manageToken.length).toBeGreaterThanOrEqual(43);
   });
 
-  it('does not produce sequential slugs', async () => {
+  it('are not sequential', async () => {
     const a = await createOk();
     const b = await createOk();
-    expect(a.slug.slice(0, 6)).not.toBe(b.slug.slice(0, 6));
+    expect(a.slug.slice(0, 7)).not.toBe(b.slug.slice(0, 7));
   });
 
-  it('accepts a custom slug once, then 409', async () => {
+  it('resolve case-insensitively, so typed or auto-capitalized links still work', async () => {
+    const link = await createOk();
+    const res = await call(`/${link.slug.toUpperCase()}`);
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe(link.url);
+  });
+
+  it('custom slugs are unique ignoring case, so "MY-LAUNCH" cannot impersonate "my-launch"', async () => {
     expect((await createOk({ url: 'https://example.com', slug: 'my-launch' })).slug).toBe('my-launch');
-    expect((await create({ url: 'https://example.com', slug: 'my-launch' })).status).toBe(409);
+    expect((await create({ url: 'https://evil.example', slug: 'MY-LAUNCH' })).status).toBe(409);
+    expect((await call('/My-Launch')).headers.get('Location')).toBe('https://example.com/');
   });
 
+  it('grow one character when the 8-char attempts collide', async () => {
+    // Force the first three random draws to the same slug: the first link takes it, the next
+    // link collides three times and must fall back to 9 chars.
+    const values = vi.spyOn(crypto, 'getRandomValues');
+    values.mockImplementation(<T extends ArrayBufferView | null>(array: T): T => {
+      const bytes = array as unknown as Uint8Array;
+      if (bytes.length === 8) bytes.fill(0);
+      else for (let i = 0; i < bytes.length; i++) bytes[i] = i; // tokens and 9-char slugs
+      return array;
+    });
+    const first = await createOk();
+    expect(first.slug).toBe('00000000');
+    const second = await createOk();
+    expect(second.slug).toHaveLength(9);
+  });
+});
+
+describe('create validation', () => {
   it.each([
     [{ url: 'javascript:alert(1)' }, 'http'],
     [{ url: 'ftp://example.com/file' }, 'http'],
     [{ url: 'not a url' }, 'http'],
     [{ url: `https://example.com/${'a'.repeat(2100)}` }, 'too long'],
-    [{ url: `${ORIGIN}/abc1234` }, 'this shortener'],
+    [{ url: `${ORIGIN}/abc12345` }, 'this shortener'],
+    [{ url: 'https://paypal.com@evil.example/login' }, 'credentials'],
+    [{ url: 'http://192.168.1.1/admin' }, 'raw IP'],
+    [{ url: 'http://[::1]:8080/' }, 'raw IP'],
+    [{ url: 'http://localhost:3000/' }, 'public domain'],
+    [{ url: 'http://intranet/wiki' }, 'public domain'],
     [{ url: 'https://example.com', slug: 'API' }, 'reserved'],
     [{ url: 'https://example.com', slug: 'a b' }, 'slug'],
     [{ url: 'https://example.com', expiresAt: '2001-01-01T00:00:00Z' }, 'future'],
   ])('rejects %j', async (body, message) => {
     const res = await create(body);
     expect(res.status).toBe(400);
-    expect((await res.json<{ error: string }>()).error).toContain(message);
+    expect(await errorOf(res)).toContain(message);
   });
 
-  it('rate limits per IP with Retry-After', async () => {
+  it('stores the normalized URL: Unicode hosts become punycode', async () => {
+    expect((await createOk({ url: 'https://bücher.example/Straße' })).url).toBe('https://xn--bcher-kva.example/Stra%C3%9Fe');
+  });
+
+  it('rejects oversized bodies with 413', async () => {
+    const res = await create({ url: 'https://example.com', pad: 'x'.repeat(10_000) });
+    expect(res.status).toBe(413);
+  });
+
+  it('refuses to run without IP_SALT instead of hashing IPs with a guessable salt', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect((await create({ url: 'https://example.com' }, { env: { IP_SALT: '' } })).status).toBe(500);
+  });
+});
+
+describe('rate limit', () => {
+  it('limits per IP with Retry-After, without affecting other IPs', async () => {
     const ip = freshIp();
-    for (let i = 0; i < 3; i++) expect((await create({ url: 'https://example.com' }, ip)).status).toBe(201);
-    const blocked = await create({ url: 'https://example.com' }, ip);
+    for (let i = 0; i < 3; i++) expect((await create({ url: 'https://example.com' }, { ip })).status).toBe(201);
+    const blocked = await create({ url: 'https://example.com' }, { ip });
     expect(blocked.status).toBe(429);
     expect(Number(blocked.headers.get('Retry-After'))).toBeGreaterThan(0);
-    expect((await create({ url: 'https://example.com' })).status).toBe(201); // other IPs unaffected
+    expect((await create({ url: 'https://example.com' })).status).toBe(201);
+  });
+
+  it('counts a whole IPv6 /64 as one client', async () => {
+    for (const ip of ['2001:db8:1:2::1', '2001:db8:1:2::2', '2001:db8:1:2:aaaa::3']) {
+      expect((await create({ url: 'https://example.com' }, { ip })).status).toBe(201);
+    }
+    expect((await create({ url: 'https://example.com' }, { ip: '2001:db8:1:2:ffff:ffff:ffff:ffff' })).status).toBe(429);
+    expect((await create({ url: 'https://example.com' }, { ip: '2001:db8:1:3::1' })).status).toBe(201);
+  });
+
+  it('forgets creator hashes older than an hour', async () => {
+    const link = await createOk();
+    const hash = () => env.DB.prepare('SELECT creator_hash FROM links WHERE slug = ?').bind(link.slug).first('creator_hash');
+    await forgetCreators(env.DB);
+    expect(await hash()).not.toBe(''); // still inside the hour
+    await forgetCreators(env.DB, Date.now() + HOUR_MS + 1);
+    expect(await hash()).toBe('');
+  });
+});
+
+describe('url screening', () => {
+  const screening = { env: { URL_SCREENING: '', SAFE_BROWSING_KEY: 'test-key' } };
+  const mockGoogle = (response: Response) => vi.spyOn(globalThis, 'fetch').mockResolvedValue(response);
+
+  it('blocks URLs Google flags', async () => {
+    const fetchSpy = mockGoogle(Response.json({ matches: [{ threatType: 'SOCIAL_ENGINEERING' }] }));
+    const res = await create({ url: 'https://phish.example/login' }, screening);
+    expect(res.status).toBe(400);
+    expect(await errorOf(res)).toContain('unsafe');
+    const [request, init] = fetchSpy.mock.calls[0]!;
+    expect(String(request)).toBe('https://safebrowsing.googleapis.com/v4/threatMatches:find?key=test-key');
+    expect(JSON.parse(String(init!.body)).threatInfo.threatEntries).toEqual([{ url: 'https://phish.example/login' }]);
+  });
+
+  it('allows URLs Google has no match for', async () => {
+    mockGoogle(Response.json({}));
+    expect((await create({ url: 'https://example.com' }, screening)).status).toBe(201);
+  });
+
+  it('fails closed when Google errors or the key is missing', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockGoogle(new Response('quota exceeded', { status: 429 }));
+    expect((await create({ url: 'https://example.com' }, screening)).status).toBe(503);
+    expect((await create({ url: 'https://example.com' }, { env: { URL_SCREENING: '', SAFE_BROWSING_KEY: '' } })).status).toBe(503);
   });
 });
 
@@ -92,16 +188,22 @@ describe('redirect', () => {
     expect(row).toEqual({ browser: 'Chrome', device: 'desktop', referrer: 'news.ycombinator.com', is_bot: 0 });
   });
 
+  it('does not count HEAD requests', async () => {
+    const link = await createOk();
+    expect((await call(`/${link.slug}`, { method: 'HEAD', headers: { 'User-Agent': CHROME } })).status).toBe(302);
+    const n = await env.DB.prepare('SELECT COUNT(*) AS n FROM clicks JOIN links ON links.id = link_id WHERE slug = ?').bind(link.slug).first('n');
+    expect(n).toBe(0);
+  });
+
   it('serves a second hit from cache without touching the links table', async () => {
     const link = await createOk();
     await call(`/${link.slug}`);
-    // Point the DB row elsewhere: a cached redirect still uses the original target.
     await env.DB.prepare('UPDATE links SET url = ? WHERE slug = ?').bind('https://changed.example', link.slug).run();
     expect((await call(`/${link.slug}`)).headers.get('Location')).toBe('https://example.com/a/long/path?x=1');
   });
 
   it('404s with an HTML page for unknown slugs', async () => {
-    const res = await call('/nope123');
+    const res = await call('/nope1234');
     expect(res.status).toBe(404);
     expect(res.headers.get('Content-Type')).toContain('text/html');
   });
@@ -114,6 +216,17 @@ describe('redirect', () => {
   });
 });
 
+describe('security headers', () => {
+  it('are set on API responses and HTML pages', async () => {
+    for (const res of [await call('/api/health'), await call('/nope1234')]) {
+      expect(res.headers.get('Content-Security-Policy')).toContain("default-src 'none'");
+      expect(res.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'none'");
+      expect(res.headers.get('X-Frame-Options')).toBe('DENY');
+      expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      expect(res.headers.get('Strict-Transport-Security')).toBeTruthy();
+    }
+  });
+});
 
 describe('stats', () => {
   it('requires the manage token', async () => {
@@ -156,11 +269,34 @@ describe('delete', () => {
   });
 });
 
+describe('admin token', () => {
+  it('can read stats for and take down any link', async () => {
+    const link = await createOk();
+    const admin = auth(env.ADMIN_TOKEN);
+    expect((await call(`/api/links/${link.slug}`, admin)).status).toBe(200);
+    expect((await call(`/api/links/${link.slug}`, { method: 'DELETE', ...admin })).status).toBe(204);
+    expect((await call(`/${link.slug}`)).status).toBe(404);
+  });
+
+  it('is ignored when shorter than 32 characters', async () => {
+    const link = await createOk();
+    expect((await call(`/api/links/${link.slug}`, auth('short'), { env: { ADMIN_TOKEN: 'short' } })).status).toBe(401);
+  });
+});
+
 describe('lib', () => {
-  it('randomSlug uses only base62 characters', () => {
+  it('randomSlug uses exactly the 32 Crockford characters', () => {
     const all = Array.from({ length: 2000 }, () => randomSlug()).join('');
-    expect(all).toMatch(/^[0-9a-zA-Z]+$/);
-    expect(new Set(all).size).toBe(62);
+    expect(all).toMatch(/^[0-9abcdefghjkmnpqrstvwxyz]+$/);
+    expect(new Set(all).size).toBe(32);
+  });
+
+  it('rateLimitKey buckets IPv6 by /64 and leaves IPv4 alone', () => {
+    expect(rateLimitKey('203.0.113.7')).toBe('203.0.113.7');
+    expect(rateLimitKey('::ffff:203.0.113.7')).toBe('203.0.113.7');
+    expect(rateLimitKey('2001:db8::1')).toBe('2001:0db8:0000:0000::/64');
+    expect(rateLimitKey('2001:DB8:0:0:1:2:3:4')).toBe('2001:0db8:0000:0000::/64');
+    expect(rateLimitKey('2001:db8:aa:bb:cc::')).toBe('2001:0db8:00aa:00bb::/64');
   });
 
   it('parseUserAgent tells Edge and Chrome apart and flags missing UAs as bots', () => {

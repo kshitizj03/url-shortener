@@ -1,2 +1,8 @@
-# Copy to .dev.vars for local dev. In production: wrangler secret put IP_SALT
+# Copy to .dev.vars for local dev. In production set each with: npx wrangler secret put <NAME>
 IP_SALT=any-long-random-string
+# Production needs a real key (free, non-commercial): Google Cloud console > Safe Browsing API.
+SAFE_BROWSING_KEY=
+# Local dev only: skip Safe Browsing. Never set this in production.
+URL_SCREENING=off
+# Optional, 32+ characters: can view stats for and delete any link (abuse takedowns).
+ADMIN_TOKEN=

@@ -2,10 +2,10 @@
 
 CREATE TABLE links (
   id           INTEGER PRIMARY KEY,
-  slug         TEXT    NOT NULL UNIQUE,
+  slug         TEXT    NOT NULL UNIQUE COLLATE NOCASE,   -- 'My-Launch' and 'my-launch' are the same link
   url          TEXT    NOT NULL,
   token_hash   TEXT    NOT NULL,          -- sha256 of the manage token, the token itself is never stored
-  creator_hash TEXT    NOT NULL,          -- sha256 of salt + IP, only used for rate limiting
+  creator_hash TEXT    NOT NULL,          -- sha256 of salt + IP bucket, rate limiting only; blanked after an hour
   created_at   INTEGER NOT NULL,
   expires_at   INTEGER
 );
