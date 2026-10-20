@@ -1,0 +1,3 @@
+# LF everywhere, including Windows checkouts: line endings end up inside built strings
+# (multi-line className literals), so CRLF made local builds differ from CI and production.
+* text=auto eol=lf
