@@ -1,6 +1,9 @@
-import { useEffect, useState } from 'react'
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { api } from '../api'
+
+// The chart (and Recharts with it) is a separate chunk, fetched only when stats are shown.
+const ClicksChart = lazy(() => import('./ClicksChart'))
+const CHART_HEIGHT = 250 // keep in sync with ClicksChart; the placeholder reserves the space
 
 function Breakdown({ title, rows }) {
   return (
@@ -98,7 +101,7 @@ function AnalyticsDashboard({ links, onDelete }) {
       {stats && (
         <div className="space-y-6">
           <div className="grid gap-4 sm:grid-cols-2">
-            <div className="p-6 bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl text-white">
+            <div className="p-6 bg-linear-to-br from-blue-500 to-blue-600 rounded-xl text-white">
               <p className="text-sm opacity-90">Human clicks, last {stats.days} days</p>
               <p className="text-4xl font-bold mt-1">{stats.clicks}</p>
             </div>
@@ -112,23 +115,21 @@ function AnalyticsDashboard({ links, onDelete }) {
             <h3 className="font-medium text-gray-800 mb-4">Last {stats.days} days</h3>
             {/* The chart is visual only; screen readers get the same numbers as a table below. */}
             <div aria-hidden="true">
-            <ResponsiveContainer width="100%" height={250}>
-              <LineChart data={stats.daily}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
-                <XAxis dataKey="day" tick={{ fontSize: 12 }} tickFormatter={(d) => d.slice(5)} />
-                <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
-                <Tooltip />
-                <Line type="monotone" dataKey="clicks" stroke="#3B82F6" strokeWidth={2} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
+            <Suspense fallback={<div style={{ height: CHART_HEIGHT }} />}>
+              <ClicksChart daily={stats.daily} />
+            </Suspense>
             </div>
-            <table className="sr-only">
-              <caption>Human clicks per day, last {stats.days} days</caption>
-              <thead><tr><th scope="col">Day</th><th scope="col">Clicks</th></tr></thead>
-              <tbody>
-                {stats.daily.map((d) => <tr key={d.day}><td>{d.day}</td><td>{d.clicks}</td></tr>)}
-              </tbody>
-            </table>
+            {/* sr-only goes on a wrapper: tables ignore its 1px height, and an unclipped ~800px
+                table left a blank scrollable area under the footer. */}
+            <div className="sr-only">
+              <table>
+                <caption>Human clicks per day, last {stats.days} days</caption>
+                <thead><tr><th scope="col">Day</th><th scope="col">Clicks</th></tr></thead>
+                <tbody>
+                  {stats.daily.map((d) => <tr key={d.day}><td>{d.day}</td><td>{d.clicks}</td></tr>)}
+                </tbody>
+              </table>
+            </div>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">

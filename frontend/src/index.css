@@ -1,6 +1,68 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+/*
+  Keep Tailwind 3's look: its font stack (same font and metrics), and its sRGB values for the
+  palette shades this app uses. Tailwind 4 re-tuned the palette in oklch, which visibly shifted
+  blue-600 (buttons) and red-700 (errors). Add a shade here before using a new one.
+*/
+@theme {
+  --font-sans: ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+
+  --color-blue-50: #eff6ff;
+  --color-blue-500: #3b82f6;
+  --color-blue-600: #2563eb;
+  --color-blue-700: #1d4ed8;
+  --color-indigo-100: #e0e7ff;
+  --color-gray-50: #f9fafb;
+  --color-gray-200: #e5e7eb;
+  --color-gray-300: #d1d5db;
+  --color-gray-400: #9ca3af;
+  --color-gray-500: #6b7280;
+  --color-gray-600: #4b5563;
+  --color-gray-700: #374151;
+  --color-gray-800: #1f2937;
+  --color-gray-900: #111827;
+  --color-green-50: #f0fdf4;
+  --color-green-200: #bbf7d0;
+  --color-green-500: #22c55e;
+  --color-green-700: #15803d;
+  --color-red-50: #fef2f2;
+  --color-red-200: #fecaca;
+  --color-red-700: #b91c1c;
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+/*
+  Two more v3 defaults that v4 changed, kept so the UI behaves the same:
+  buttons show a pointer cursor, and placeholders use gray-400.
+*/
+@layer base {
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-gray-400);
+  }
+}
 
 body {
   @apply bg-gray-50 text-gray-900 antialiased;
